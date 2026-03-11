@@ -442,6 +442,40 @@ struct Output {
     platform: Platform,
 }
 
+/// A deferred subtree/node output.
+///
+/// This is the state immediately before choosing whether a subtree/node should
+/// be reduced to a non-root chaining value or finalized as the root hash.
+///
+/// Advanced callers can use this to hash a subtree exactly once and defer the
+/// root/non-root decision until later.
+///
+/// This is useful for implementations that hash legal BLAKE3 subtrees out of
+/// order and perform parent merges outside this crate.
+#[derive(Clone)]
+pub struct NodeOutput(Output);
+
+impl NodeOutput {
+    /// Return the non-root chaining value for this subtree/node.
+    #[inline]
+    pub fn chaining_value(&self) -> [u8; OUT_LEN] {
+        self.0.chaining_value()
+    }
+
+    /// Finalize this subtree/node as the root hash.
+    #[inline]
+    pub fn root_hash(&self) -> Hash {
+        self.0.root_hash()
+    }
+}
+
+#[cfg(feature = "zeroize")]
+impl Zeroize for NodeOutput {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 impl Output {
     fn chaining_value(&self) -> CVBytes {
         let mut cv = self.input_chaining_value;
@@ -874,14 +908,21 @@ fn compress_subtree_to_parent_node<J: join::Join>(
     *array_ref!(cv_array, 0, 2 * OUT_LEN)
 }
 
-// Hash a complete input all at once. Unlike compress_subtree_wide() and
+// Hash a complete subtree all at once. Unlike compress_subtree_wide() and
 // compress_subtree_to_parent_node(), this function handles the 1 chunk case.
-fn hash_all_at_once<J: join::Join>(input: &[u8], key: &CVWords, flags: u8) -> Output {
+//
+// `chunk_counter` is the chunk index where this subtree begins.
+fn output_subtree_at_once<J: join::Join>(
+    input: &[u8],
+    key: &CVWords,
+    chunk_counter: u64,
+    flags: u8,
+) -> Output {
     let platform = Platform::detect();
 
     // If the whole subtree is one chunk, hash it directly with a ChunkState.
     if input.len() <= CHUNK_LEN {
-        return ChunkState::new(key, 0, flags, platform)
+        return ChunkState::new(key, chunk_counter, flags, platform)
             .update(input)
             .output();
     }
@@ -890,12 +931,81 @@ fn hash_all_at_once<J: join::Join>(input: &[u8], key: &CVWords, flags: u8) -> Ou
     // compress_subtree_to_parent_node().
     Output {
         input_chaining_value: *key,
-        block: compress_subtree_to_parent_node::<J>(input, key, 0, flags, platform),
+        block: compress_subtree_to_parent_node::<J>(input, key, chunk_counter, flags, platform),
         block_len: BLOCK_LEN as u8,
         counter: 0,
         flags: flags | PARENT,
         platform,
     }
+}
+
+/// Hash a single legal subtree beginning at `input_offset` and return a
+/// deferred [`NodeOutput`].
+///
+/// The caller can later choose between [`NodeOutput::chaining_value`] and
+/// [`NodeOutput::root_hash`] without re-reading the input.
+///
+/// This is a low-level API intended for advanced callers.
+///
+/// # Panics
+///
+/// Panics if:
+///
+/// - `input` is empty
+/// - `input_offset` is not chunk-aligned
+/// - `input` is longer than the maximum subtree length allowed at that offset
+///
+/// For the regular hash function only. If you need keyed hashing or key
+/// derivation with this pattern, add analogous helpers that pass the
+/// appropriate key/flags.
+pub fn hash_subtree_output(input: &[u8], input_offset: u64) -> NodeOutput {
+    assert!(!input.is_empty(), "empty input is not a subtree");
+    assert_eq!(
+        input_offset % CHUNK_LEN as u64,
+        0,
+        "input_offset must be chunk-aligned",
+    );
+
+    if let Some(max) = hazmat::max_subtree_len(input_offset) {
+        assert!(
+            input.len() as u64 <= max,
+            "the subtree starting at {} contains at most {} bytes (found {})",
+            input_offset,
+            max,
+            input.len(),
+        );
+    }
+
+    let chunk_counter = input_offset / CHUNK_LEN as u64;
+    NodeOutput(output_subtree_at_once::<join::SerialJoin>(
+        input,
+        IV,
+        chunk_counter,
+        0,
+    ))
+}
+
+/// Reduce a legal non-root subtree beginning at `input_offset` to its chaining
+/// value.
+///
+/// This is equivalent to `hash_subtree_output(input, input_offset).chaining_value()`.
+#[inline]
+pub fn hash_subtree_cv(input: &[u8], input_offset: u64) -> [u8; OUT_LEN] {
+    hash_subtree_output(input, input_offset).chaining_value()
+}
+
+/// Construct a deferred parent output from two child chaining values.
+///
+/// For the regular hash function only.
+#[inline]
+pub fn parent_output(left_child: &[u8; OUT_LEN], right_child: &[u8; OUT_LEN]) -> NodeOutput {
+    NodeOutput(parent_node_output(
+        left_child,
+        right_child,
+        IV,
+        0,
+        Platform::detect(),
+    ))
 }
 
 /// The default hash function.
@@ -918,7 +1028,7 @@ fn hash_all_at_once<J: join::Join>(input: &[u8], key: &CVWords, flags: u8) -> Ou
 /// This function is always single-threaded. For multithreading support, see
 /// [`Hasher::update_rayon`](struct.Hasher.html#method.update_rayon).
 pub fn hash(input: &[u8]) -> Hash {
-    hash_all_at_once::<join::SerialJoin>(input, IV, 0).root_hash()
+    output_subtree_at_once::<join::SerialJoin>(input, IV, 0, 0).root_hash()
 }
 
 /// The keyed hash function.
@@ -948,7 +1058,7 @@ pub fn hash(input: &[u8]) -> Hash {
 /// [`Hasher::update_rayon`](struct.Hasher.html#method.update_rayon).
 pub fn keyed_hash(key: &[u8; KEY_LEN], input: &[u8]) -> Hash {
     let key_words = platform::words_from_le_bytes_32(key);
-    hash_all_at_once::<join::SerialJoin>(input, &key_words, KEYED_HASH).root_hash()
+    output_subtree_at_once::<join::SerialJoin>(input, &key_words, 0, KEYED_HASH).root_hash()
 }
 
 /// The key derivation function.
@@ -1003,7 +1113,7 @@ pub fn keyed_hash(key: &[u8; KEY_LEN], input: &[u8]) -> Hash {
 pub fn derive_key(context: &str, key_material: &[u8]) -> [u8; OUT_LEN] {
     let context_key = hazmat::hash_derive_key_context(context);
     let context_key_words = platform::words_from_le_bytes_32(&context_key);
-    hash_all_at_once::<join::SerialJoin>(key_material, &context_key_words, DERIVE_KEY_MATERIAL)
+    output_subtree_at_once::<join::SerialJoin>(key_material, &context_key_words, 0, DERIVE_KEY_MATERIAL)
         .root_hash()
         .0
 }
@@ -1026,6 +1136,22 @@ fn parent_node_output(
         flags: flags | PARENT,
         platform,
     }
+}
+
+/// Combine two child chaining values into a non-root parent chaining value.
+///
+/// For the regular hash function only.
+#[inline]
+pub fn parent_cv(left_child: &[u8; OUT_LEN], right_child: &[u8; OUT_LEN]) -> [u8; OUT_LEN] {
+    parent_output(left_child, right_child).chaining_value()
+}
+
+/// Combine two child chaining values and finalize them as the root hash.
+///
+/// For the regular hash function only.
+#[inline]
+pub fn root_hash(left_child: &[u8; OUT_LEN], right_child: &[u8; OUT_LEN]) -> Hash {
+    parent_output(left_child, right_child).root_hash()
 }
 
 /// An incremental hash state that can accept any number of writes.
