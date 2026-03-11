@@ -557,9 +557,10 @@ pub type ContextKey = [u8; KEY_LEN];
 /// assert_eq!(derived_key, blake3::derive_key("foo", b"bar"));
 /// ```
 pub fn hash_derive_key_context(context: &str) -> ContextKey {
-    crate::hash_all_at_once::<crate::join::SerialJoin>(
+    crate::output_subtree_at_once::<crate::join::SerialJoin>(
         context.as_bytes(),
         IV,
+        0,
         crate::DERIVE_KEY_CONTEXT,
     )
     .root_hash()
